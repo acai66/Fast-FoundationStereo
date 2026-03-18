@@ -74,7 +74,14 @@ class Combined_Geo_Encoding_Volume:
           fmap2 = fmap2.view(B, D, H, W2)
           if normalize:
             with torch.cuda.amp.autocast(enabled=False):
-              corr = torch.einsum('aijk,aijh->ajkh', F.normalize(fmap1.float(), dim=1), F.normalize(fmap2.float(), dim=1))
+              fmap1_norm = F.normalize(fmap1.float(), dim=1)
+              fmap2_norm = F.normalize(fmap2.float(), dim=1)
+              if torch.onnx.is_in_onnx_export() and torch.onnx.utils.GLOBALS.export_onnx_opset_version < 12:
+                fmap1_norm = torch.permute(fmap1_norm, (0, 2, 3, 1)).view(-1, W1, D)
+                fmap2_norm = torch.permute(fmap2_norm, (0, 2, 1, 3)).view(-1, D, W2)
+                corr = torch.bmm(fmap1_norm, fmap2_norm).view(B, H, W1, W2)
+              else:
+                corr = torch.einsum('aijk,aijh->ajkh', fmap1_norm, fmap2_norm)
           else:
             corr = corr.view(B, H, W1, 1, W2).to(fmap1.dtype)
           corr = corr.view(B, H, W1, 1, W2).to(fmap1.dtype)
