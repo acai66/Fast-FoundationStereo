@@ -217,11 +217,20 @@ class FlashMultiheadAttention(nn.Module):
         K = self.k_proj(key)
         V = self.v_proj(value)
 
-        Q = Q.view(Q.size(0), Q.size(1), self.num_heads, self.head_dim)
-        K = K.view(K.size(0), K.size(1), self.num_heads, self.head_dim)
-        V = V.view(V.size(0), V.size(1), self.num_heads, self.head_dim)
+        if torch.onnx.is_in_onnx_export() and torch.onnx.utils.GLOBALS.export_onnx_opset_version < 14:
+          Q = Q.view(-1, self.num_heads, self.head_dim)
+          K = K.view(-1, self.num_heads, self.head_dim)
+          V = V.view(-1, self.num_heads, self.head_dim)
+          attn_output = torch.bmm(Q, K.transpose(1, 2))
+          attn_output = attn_output / torch.sqrt(torch.tensor(self.head_dim, dtype=Q.dtype))
+          attn_output = F.softmax(attn_output, dim=-1)
+          attn_output = torch.bmm(attn_output, V)
+        else:
+          Q = Q.view(Q.size(0), Q.size(1), self.num_heads, self.head_dim)
+          K = K.view(K.size(0), K.size(1), self.num_heads, self.head_dim)
+          V = V.view(V.size(0), V.size(1), self.num_heads, self.head_dim)
 
-        attn_output = F.scaled_dot_product_attention(Q, K, V)
+          attn_output = F.scaled_dot_product_attention(Q, K, V)
 
         attn_output = attn_output.reshape(B,L,-1)
         output = self.out_proj(attn_output)
@@ -619,7 +628,7 @@ class ChannelAttentionEnhancement(nn.Module):
 
     def forward(self, x):
         avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
+        max_out = self.fc(torch.max(x.view(x.shape[0],x.shape[1], -1), dim=2, keepdim=True).values[..., None])
         out = avg_out + max_out
         return self.sigmoid(out)
 

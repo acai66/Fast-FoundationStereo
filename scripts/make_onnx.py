@@ -67,7 +67,7 @@ if __name__ == '__main__':
     )
 
     features_left_04, features_left_08, features_left_16, features_left_32, features_right_04, stem_2x = feature_runner(left_img, right_img)
-    gwc_volume = build_gwc_volume_triton(features_left_04.half(), features_right_04.half(), args.max_disp//4, model.cv_group)
+    gwc_volume = build_gwc_volume_triton(features_left_04, features_right_04, args.max_disp//4, model.cv_group)
     disp = post_runner(features_left_04.float(), features_left_08.float(), features_left_16.float(), features_left_32.float(), features_right_04.float(), stem_2x.float(), gwc_volume.float())
 
     torch.onnx.export(
