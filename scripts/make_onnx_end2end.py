@@ -11,7 +11,7 @@ Usage:
         --height 448 --width 640 \
         --valid_iters 8 \
         --max_disp 192 \
-        --opset_version 11
+        --opset_version 18
 """
 
 import os
@@ -25,8 +25,10 @@ os.environ["TORCHDYNAMO_DISABLE"] = "1"
 code_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(f"{code_dir}/../")
 
+import numpy as np
 import yaml
 import onnx
+from onnx import numpy_helper, shape_inference
 import onnxslim
 import torch
 import torch.nn as nn
@@ -35,12 +37,284 @@ from omegaconf import OmegaConf
 
 from core.foundation_stereo import FastFoundationStereo, normalize_image
 from core.submodule import (
+    build_concat_volume_optimized_pytorch1,
+    build_gwc_volume_optimized_pytorch1,
+    context_upsample,
     disparity_regression,
 )
 from core.geometry import Combined_Geo_Encoding_Volume
 import Utils as U
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+# ---------------------------------------------------------------------------
+# ONNX post-export: Gelu reshape cleanup + FP16-safe epsilons
+# ---------------------------------------------------------------------------
+
+
+def _onnx_get_attribute(node: onnx.NodeProto, name: str, default=None):
+    for attr in node.attribute:
+        if attr.name == name:
+            if attr.type == onnx.AttributeProto.INT:
+                return attr.i
+            if attr.type == onnx.AttributeProto.INTS:
+                return list(attr.ints)
+            if attr.type == onnx.AttributeProto.FLOAT:
+                return attr.f
+            if attr.type == onnx.AttributeProto.STRING:
+                return attr.s.decode("utf-8")
+            if attr.type == onnx.AttributeProto.TENSOR:
+                return numpy_helper.to_array(attr.t)
+    return default
+
+
+def _clear_onnx_value_info(graph: onnx.GraphProto) -> None:
+    """Remove value_info so shape_inference recomputes from scratch."""
+    del graph.value_info[:]
+
+
+def _cleanup_unused_initializers(graph: onnx.GraphProto):
+    """Remove initializers that are no longer referenced by any node."""
+    used_inputs = set()
+    for node in graph.node:
+        for inp in node.input:
+            used_inputs.add(inp)
+
+    to_remove = [init for init in graph.initializer if init.name not in used_inputs]
+    for init in to_remove:
+        graph.initializer.remove(init)
+    if to_remove:
+        logging.info(f"  Cleaned up {len(to_remove)} unused initializer(s)")
+
+
+def _build_onnx_maps(graph: onnx.GraphProto):
+    output_to_node: dict[str, onnx.NodeProto] = {}
+    input_to_nodes: dict[str, list[onnx.NodeProto]] = {}
+    name_to_node: dict[str, onnx.NodeProto] = {}
+
+    for node in graph.node:
+        if node.name:
+            name_to_node[node.name] = node
+        for out in node.output:
+            output_to_node[out] = node
+        for inp in node.input:
+            input_to_nodes.setdefault(inp, []).append(node)
+
+    initializer_names = {init.name for init in graph.initializer}
+
+    shape_map: dict[str, list | None] = {}
+    for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
+        if vi.type.HasField("tensor_type") and vi.type.tensor_type.HasField("shape"):
+            dims = []
+            for d in vi.type.tensor_type.shape.dim:
+                if d.dim_param:
+                    dims.append(d.dim_param)
+                else:
+                    dims.append(d.dim_value)
+            shape_map[vi.name] = dims
+
+    const_map: dict[str, np.ndarray] = {}
+    for init in graph.initializer:
+        const_map[init.name] = numpy_helper.to_array(init)
+    for node in graph.node:
+        if node.op_type == "Constant":
+            val = _onnx_get_attribute(node, "value")
+            if val is not None and len(node.output) > 0:
+                const_map[node.output[0]] = val
+
+    return (
+        output_to_node,
+        input_to_nodes,
+        name_to_node,
+        initializer_names,
+        shape_map,
+        const_map,
+    )
+
+
+def _get_reshape_target_shape(
+    node: onnx.NodeProto, const_map: dict
+) -> list[int] | None:
+    if len(node.input) < 2:
+        return None
+    shape_input = node.input[1]
+    if shape_input in const_map:
+        return const_map[shape_input].tolist()
+    return None
+
+
+def _count_onnx_consumers(tensor_name: str, input_to_nodes: dict) -> int:
+    return len(input_to_nodes.get(tensor_name, []))
+
+
+def optimize_gelu_reshape(graph: onnx.GraphProto) -> int:
+    """Remove Reshape pairs around Gelu when input/output shapes match."""
+    output_to_node, input_to_nodes, _, _, shape_map, const_map = _build_onnx_maps(graph)
+    nodes_to_remove = set()
+    rewire_map: dict[str, str] = {}
+    count = 0
+
+    for node in graph.node:
+        if node.op_type != "Gelu":
+            continue
+
+        gelu_input = node.input[0]
+        gelu_output = node.output[0]
+
+        if gelu_input not in output_to_node:
+            continue
+        reshape_a = output_to_node[gelu_input]
+        if reshape_a.op_type != "Reshape":
+            continue
+
+        consumers = input_to_nodes.get(gelu_output, [])
+        if len(consumers) != 1:
+            continue
+        reshape_b = consumers[0]
+        if reshape_b.op_type != "Reshape":
+            continue
+
+        if _count_onnx_consumers(gelu_input, input_to_nodes) != 1:
+            continue
+
+        reshape_a_input = reshape_a.input[0]
+        reshape_b_output = reshape_b.output[0]
+
+        shape_a_in = shape_map.get(reshape_a_input)
+        shape_b_out = shape_map.get(reshape_b_output)
+
+        target_a = _get_reshape_target_shape(reshape_a, const_map)
+        target_b = _get_reshape_target_shape(reshape_b, const_map)
+
+        shapes_match = False
+        if shape_a_in is not None and shape_b_out is not None:
+            shapes_match = shape_a_in == shape_b_out
+        elif target_a is not None and target_b is not None and shape_a_in is not None:
+            shapes_match = shape_a_in == list(shape_b_out) if shape_b_out else False
+
+        if not shapes_match:
+            continue
+
+        logging.info(
+            "  Gelu pattern: %s -> %s -> %s",
+            reshape_a.name or reshape_a.op_type,
+            node.name or node.op_type,
+            reshape_b.name or reshape_b.op_type,
+        )
+
+        node.input[0] = reshape_a_input
+        rewire_map[reshape_b_output] = node.output[0]
+
+        nodes_to_remove.add(id(reshape_a))
+        nodes_to_remove.add(id(reshape_b))
+        count += 1
+
+    if rewire_map:
+        for n in graph.node:
+            for i, inp in enumerate(n.input):
+                if inp in rewire_map:
+                    n.input[i] = rewire_map[inp]
+        for out in graph.output:
+            if out.name in rewire_map:
+                out.name = rewire_map[out.name]
+
+    remaining = [n for n in graph.node if id(n) not in nodes_to_remove]
+    del graph.node[:]
+    graph.node.extend(remaining)
+
+    return count
+
+
+def fix_fp16_unsafe_constants(graph: onnx.GraphProto) -> int:
+    """Bump tiny epsilon constants that underflow in FP16 (Clip/Min/Max/etc.)."""
+    FP16_SAFE_EPS = np.float32(6.0e-8)
+    FP16_MIN_SUBNORMAL = 6.0e-8
+    count = 0
+
+    init_map: dict[str, onnx.TensorProto] = {
+        init.name: init for init in graph.initializer
+    }
+
+    sensitive_ops = {"Clip", "Min", "Max", "Div", "Where"}
+
+    sensitive_inputs: set[str] = set()
+    for node in graph.node:
+        if node.op_type in sensitive_ops:
+            for inp in node.input:
+                sensitive_inputs.add(inp)
+
+    for node in graph.node:
+        if node.op_type == "Constant":
+            val = _onnx_get_attribute(node, "value")
+            if val is not None and val.size == 1 and len(node.output) > 0:
+                scalar = float(val.flat[0])
+                if (
+                    0 < scalar < FP16_MIN_SUBNORMAL
+                    and node.output[0] in sensitive_inputs
+                ):
+                    logging.info(
+                        "  Bumping constant %s: %s -> %s",
+                        node.name or node.output[0],
+                        scalar,
+                        float(FP16_SAFE_EPS),
+                    )
+                    new_val = np.array([FP16_SAFE_EPS], dtype=val.dtype).reshape(
+                        val.shape
+                    )
+                    for attr in node.attribute:
+                        if attr.name == "value":
+                            attr.t.CopyFrom(numpy_helper.from_array(new_val))
+                            break
+                    count += 1
+
+    for name in sensitive_inputs:
+        if name in init_map:
+            init = init_map[name]
+            val = numpy_helper.to_array(init)
+            if val.size == 1:
+                scalar = float(val.flat[0])
+                if 0 < scalar < FP16_MIN_SUBNORMAL:
+                    logging.info(
+                        "  Bumping initializer %s: %s -> %s",
+                        name,
+                        scalar,
+                        float(FP16_SAFE_EPS),
+                    )
+                    new_val = np.array([FP16_SAFE_EPS], dtype=val.dtype).reshape(
+                        val.shape
+                    )
+                    init.CopyFrom(numpy_helper.from_array(new_val, name=name))
+                    count += 1
+
+    return count
+
+
+def postprocess_onnx_graph(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Clear stale shapes, infer, Gelu/Reshape opt, FP16 eps fix, re-infer."""
+    try:
+        model = shape_inference.infer_shapes(model)
+    except Exception as e:
+        logging.warning("ONNX shape inference (pre-opt) failed (non-fatal): %s", e)
+
+    graph = model.graph
+
+    n_gelu = optimize_gelu_reshape(graph)
+    logging.info("Removed %d Gelu-adjacent Reshape pair(s)", n_gelu)
+
+    n_fp16 = fix_fp16_unsafe_constants(graph)
+    logging.info("Adjusted %d FP16-unsafe epsilon constant(s)", n_fp16)
+
+    _cleanup_unused_initializers(graph)
+
+    _clear_onnx_value_info(graph)
+    try:
+        model = shape_inference.infer_shapes(model)
+        logging.info("ONNX shape re-inference succeeded.")
+    except Exception as e:
+        logging.warning("ONNX shape inference (post-opt) failed (non-fatal): %s", e)
+
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +444,13 @@ class End2EndStereo(nn.Module):
         xspx = self.spx_2_gru(mask_feat_4, stem_2x)
         spx_pred = self.spx_gru(xspx)
         spx_pred = F.softmax(spx_pred, 1)
-        up_disp = context_upsample_onnx(disp * 4.0, spx_pred).unsqueeze(1)
+        if (
+            torch.onnx.is_in_onnx_export()
+            and torch.onnx.utils.GLOBALS.export_onnx_opset_version < 18
+        ):
+            up_disp = context_upsample_onnx(disp * 4.0, spx_pred).unsqueeze(1)
+        else:
+            up_disp = context_upsample(disp * 4.0, spx_pred).unsqueeze(1)
         return up_disp.to(self.dtype)
 
     def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
@@ -184,19 +464,39 @@ class End2EndStereo(nn.Module):
         stem_2x = self.stem_2(left_n)
 
         maxdisp_quarter = self.args.max_disp // 4
-        gwc_volume = build_gwc_volume_onnx(
-            features_left[0],
-            features_right[0],
-            maxdisp_quarter,
-            self.cv_group,
-            normalize=self.args.get("normalize", True),
-        )
+        if (
+            torch.onnx.is_in_onnx_export()
+            and torch.onnx.utils.GLOBALS.export_onnx_opset_version < 18
+        ):
+            gwc_volume = build_gwc_volume_onnx(
+                features_left[0],
+                features_right[0],
+                maxdisp_quarter,
+                self.cv_group,
+                normalize=self.args.get("normalize", True),
+            )
+        else:
+            gwc_volume = build_gwc_volume_optimized_pytorch1(
+                features_left[0],
+                features_right[0],
+                maxdisp_quarter,
+                self.cv_group,
+                normalize=self.args.get("normalize", True),
+            )
 
         left_tmp = self.proj_cmb(features_left[0])
         right_tmp = self.proj_cmb(features_right[0])
-        concat_volume = build_concat_volume_onnx(
-            left_tmp, right_tmp, maxdisp=maxdisp_quarter
-        )
+        if (
+            torch.onnx.is_in_onnx_export()
+            and torch.onnx.utils.GLOBALS.export_onnx_opset_version < 18
+        ):
+            concat_volume = build_concat_volume_onnx(
+                left_tmp, right_tmp, maxdisp=maxdisp_quarter
+            )
+        else:
+            concat_volume = build_concat_volume_optimized_pytorch1(
+                left_tmp, right_tmp, maxdisp=maxdisp_quarter
+            )
 
         comb_volume = torch.cat([gwc_volume, concat_volume], dim=1)
         comb_volume = self.corr_stem(comb_volume)
@@ -302,10 +602,13 @@ if __name__ == "__main__":
             input_names=["left", "right"],
             output_names=["disp"],
             do_constant_folding=True,
-            dynamo=False,
+            dynamo=args.opset_version >= 18,
         )
-    model_onnx = onnx.load(onnx_path)  # load onnx model
+    logging.info("Optimizing ONNX model ...")
+    model_onnx = onnx.load(onnx_path)
     model_onnx = onnxslim.slim(model_onnx)
+    model_onnx = postprocess_onnx_graph(model_onnx)
+    onnx.checker.check_model(model_onnx)
     onnx.save(model_onnx, onnx_path)
 
     logging.info(f"ONNX model saved to {onnx_path}")

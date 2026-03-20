@@ -176,6 +176,21 @@ def build_gwc_volume_numpy(
 
 def create_session(onnx_path: str) -> ort.InferenceSession:
     providers = []
+    if "TensorrtExecutionProvider" in ort.get_available_providers():
+        providers.append(
+            (
+                "TensorrtExecutionProvider",
+                {
+                    "device_id": 0,
+                    "trt_max_workspace_size": 5 * 1024 * 1024 * 1024,
+                    "trt_fp16_enable": True,
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": "trt_engine_cache",
+                    "trt_engine_cache_prefix": "ffs",
+                    "trt_detailed_build_log": False,
+                },
+            )
+        )
     if "CUDAExecutionProvider" in ort.get_available_providers():
         providers.append("CUDAExecutionProvider")
     providers.append("CPUExecutionProvider")

@@ -33,6 +33,10 @@ def normalize_image(img):
     '''
     @img: (B,C,H,W) in range 0-255, RGB order
     '''
+    if torch.onnx.is_in_onnx_export():
+      a = torch.tensor([0.0171, 0.0175, 0.0174], dtype=img.dtype, device=img.device).view(1, 3, 1, 1)
+      b = torch.tensor([-2.1179, -2.0357, -1.8044], dtype=img.dtype, device=img.device).view(1, 3, 1, 1)
+      return a * img + b
     mean = img.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     std = img.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
     return (img/255.0 - mean) / std
